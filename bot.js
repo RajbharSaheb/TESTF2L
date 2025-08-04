@@ -1,254 +1,274 @@
-const TelegramBot = require('node-telegram-bot-api');
 const express = require('express');
+const TelegramBot = require('node-telegram-bot-api');
+const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
 
-// Bot Configuration
-const BOT_TOKEN = 'YOUR_BOT_TOKEN_HERE';
-const WEBAPP_URL = 'https://your-domain.com'; // Replace with your domain
-const PORT = process.env.PORT || 3000;
-
-const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 const app = express();
+const PORT = process.env.PORT || 3000;
+const BOT_TOKEN = process.env.BOT_TOKEN;
+const WEBHOOK_URL = process.env.WEBHOOK_URL;
 
-// In-memory storage for file info (use Redis in production)
-const fileStorage = new Map();
+// Bot initialization
+const bot = new TelegramBot(BOT_TOKEN, { webHook: true });
+bot.setWebHook(`${WEBHOOK_URL}/bot${BOT_TOKEN}`);
 
 // Middleware
-app.use(express.static('public'));
 app.use(express.json());
+app.use(express.static('public'));
 
-// Generate unique file ID
-function generateFileId() {
-  return crypto.randomBytes(16).toString('hex');
-}
-
-// Bot message handler
-bot.on('message', async (msg) => {
-  const chatId = msg.chat.id;
-  
-  if (msg.document || msg.video || msg.audio || msg.photo) {
-    try {
-      let file, fileName, fileSize;
-      
-      if (msg.document) {
-        file = msg.document;
-        fileName = file.file_name || 'document';
-        fileSize = file.file_size;
-      } else if (msg.video) {
-        file = msg.video;
-        fileName = `video_${Date.now()}.mp4`;
-        fileSize = file.file_size;
-      } else if (msg.audio) {
-        file = msg.audio;
-        fileName = file.title || `audio_${Date.now()}.mp3`;
-        fileSize = file.file_size;
-      } else if (msg.photo) {
-        file = msg.photo[msg.photo.length - 1];
-        fileName = `photo_${Date.now()}.jpg`;
-        fileSize = file.file_size;
-      }
-      
-      // Check file size (4GB limit)
-      if (fileSize > 4 * 1024 * 1024 * 1024) {
-        return bot.sendMessage(chatId, '❌ File size exceeds 4GB limit!');
-      }
-      
-      // Generate unique ID and store file info
-      const fileId = generateFileId();
-      const fileInfo = {
-        telegramFileId: file.file_id,
-        fileName: fileName,
-        fileSize: fileSize,
-        mimeType: file.mime_type || 'application/octet-stream',
-        uploadedAt: new Date(),
-        chatId: chatId
-      };
-      
-      fileStorage.set(fileId, fileInfo);
-      
-      // Generate links
-      const streamLink = `${WEBAPP_URL}/stream/${fileId}`;
-      const webPageLink = `${WEBAPP_URL}/file/${fileId}`;
-      
-      // Send response with inline keyboard
-      const keyboard = {
-        reply_markup: {
-          inline_keyboard: [
-            [
-              { text: '🎬 Stream', url: streamLink },
-              { text: '📱 Web Page', url: webPageLink }
-            ],
-            [
-              { text: '📋 Copy Stream Link', callback_data: `copy_stream_${fileId}` },
-              { text: '📋 Copy Web Link', callback_data: `copy_web_${fileId}` }
-            ]
-          ]
-        }
-      };
-      
-      const message = `✅ File uploaded successfully!\n\n` +
-                     `📁 **File:** ${fileName}\n` +
-                     `📏 **Size:** ${formatFileSize(fileSize)}\n` +
-                     `🔗 **Stream Link:** ${streamLink}\n` +
-                     `🌐 **Web Page:** ${webPageLink}`;
-      
-      bot.sendMessage(chatId, message, { 
-        parse_mode: 'Markdown',
-        ...keyboard
-      });
-      
-    } catch (error) {
-      console.error('Error processing file:', error);
-      bot.sendMessage(chatId, '❌ Error processing file. Please try again.');
+// File storage
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    const uploadDir = 'uploads';
+    if (!fs.existsSync(uploadDir)) {
+      fs.mkdirSync(uploadDir, { recursive: true });
     }
-  } else if (msg.text === '/start') {
-    const welcomeMessage = `🤖 **File Streaming Bot**\n\n` +
-                          `Send me any file (up to 4GB) and I'll generate:\n` +
-                          `• 🎬 Direct stream link\n` +
-                          `• 🌐 Professional web page\n` +
-                          `• 📥 Download option\n\n` +
-                          `Supported formats: Videos, Documents, Audio, Images`;
-    
-    bot.sendMessage(chatId, welcomeMessage, { parse_mode: 'Markdown' });
+    cb(null, uploadDir);
+  },
+  filename: (req, file, cb) => {
+    const uniqueId = crypto.randomBytes(16).toString('hex');
+    cb(null, `${uniqueId}_${file.originalname}`);
   }
 });
 
-// Callback query handler
-bot.on('callback_query', (callbackQuery) => {
-  const data = callbackQuery.data;
-  const chatId = callbackQuery.message.chat.id;
-  
-  if (data.startsWith('copy_stream_')) {
-    const fileId = data.replace('copy_stream_', '');
-    const streamLink = `${WEBAPP_URL}/stream/${fileId}`;
-    bot.sendMessage(chatId, `📋 Stream Link:\n\`${streamLink}\``, { parse_mode: 'Markdown' });
-  } else if (data.startsWith('copy_web_')) {
-    const fileId = data.replace('copy_web_', '');
-    const webLink = `${WEBAPP_URL}/file/${fileId}`;
-    bot.sendMessage(chatId, `📋 Web Page Link:\n\`${webLink}\``, { parse_mode: 'Markdown' });
-  }
-  
-  bot.answerCallbackQuery(callbackQuery.id);
+const upload = multer({ 
+  storage,
+  limits: { fileSize: 4 * 1024 * 1024 * 1024 } // 4GB limit
 });
 
-// Web routes
-app.get('/file/:fileId', (req, res) => {
-  const fileId = req.params.fileId;
-  const fileInfo = fileStorage.get(fileId);
-  
-  if (!fileInfo) {
-    return res.status(404).send('File not found');
-  }
-  
-  const html = generateWebPage(fileId, fileInfo);
-  res.send(html);
-});
+// In-memory storage for file metadata
+const fileDatabase = new Map();
 
-app.get('/stream/:fileId', async (req, res) => {
-  const fileId = req.params.fileId;
-  const fileInfo = fileStorage.get(fileId);
-  
-  if (!fileInfo) {
-    return res.status(404).send('File not found');
-  }
-  
-  try {
-    const fileUrl = await bot.getFileLink(fileInfo.telegramFileId);
-    
-    // Set appropriate headers for streaming
-    res.setHeader('Content-Type', fileInfo.mimeType);
-    res.setHeader('Content-Disposition', `inline; filename="${fileInfo.fileName}"`);
-    res.setHeader('Accept-Ranges', 'bytes');
-    
-    // Proxy the file stream
-    const https = require('https');
-    const http = require('http');
-    const protocol = fileUrl.startsWith('https:') ? https : http;
-    
-    protocol.get(fileUrl, (fileStream) => {
-      fileStream.pipe(res);
-    }).on('error', (error) => {
-      console.error('Stream error:', error);
-      res.status(500).send('Stream error');
-    });
-    
-  } catch (error) {
-    console.error('Error getting file link:', error);
-    res.status(500).send('Error streaming file');
-  }
-});
+// Bot commands
+bot.onText(/\/start/, (msg) => {
+  const chatId = msg.chat.id;
+  bot.sendMessage(chatId, `🚀 Welcome to File Stream Bot!
 
-app.get('/download/:fileId', async (req, res) => {
-  const fileId = req.params.fileId;
-  const fileInfo = fileStorage.get(fileId);
-  
-  if (!fileInfo) {
-    return res.status(404).send('File not found');
-  }
-  
-  try {
-    const fileUrl = await bot.getFileLink(fileInfo.telegramFileId);
-    
-    // Set download headers
-    res.setHeader('Content-Disposition', `attachment; filename="${fileInfo.fileName}"`);
-    res.setHeader('Content-Type', 'application/octet-stream');
-    
-    // Proxy the file download
-    const https = require('https');
-    const http = require('http');
-    const protocol = fileUrl.startsWith('https:') ? https : http;
-    
-    protocol.get(fileUrl, (fileStream) => {
-      fileStream.pipe(res);
-    }).on('error', (error) => {
-      console.error('Download error:', error);
-      res.status(500).send('Download error');
-    });
-    
-  } catch (error) {
-    console.error('Error getting file link:', error);
-    res.status(500).send('Error downloading file');
-  }
-});
+📤 Simply send me any file (up to 4GB) and I'll generate:
+• 🔗 Instant streaming link
+• 📱 Modern web player
+• ⬇️ Download option
 
-// API endpoint for file info
-app.get('/api/file/:fileId', (req, res) => {
-  const fileId = req.params.fileId;
-  const fileInfo = fileStorage.get(fileId);
-  
-  if (!fileInfo) {
-    return res.status(404).json({ error: 'File not found' });
-  }
-  
-  res.json({
-    fileName: fileInfo.fileName,
-    fileSize: fileInfo.fileSize,
-    fileSizeFormatted: formatFileSize(fileInfo.fileSize),
-    mimeType: fileInfo.mimeType,
-    uploadedAt: fileInfo.uploadedAt
+Ready to share your files? Just send them over! ✨`, {
+    reply_markup: {
+      inline_keyboard: [[
+        { text: '📖 Help', callback_data: 'help' },
+        { text: '📊 Stats', callback_data: 'stats' }
+      ]]
+    }
   });
 });
 
-// Utility function to format file size
-function formatFileSize(bytes) {
-  if (bytes === 0) return '0 B';
-  const k = 1024;
-  const sizes = ['B', 'KB', 'MB', 'GB'];
-  const i = Math.floor(Math.log(bytes) / Math.log(k));
-  return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+bot.onText(/\/help/, (msg) => {
+  const chatId = msg.chat.id;
+  bot.sendMessage(chatId, `📖 **How to Use:**
+
+1️⃣ Send any file to the bot
+2️⃣ Get instant streaming link
+3️⃣ Share the link with anyone
+4️⃣ Files can be streamed or downloaded
+
+**Supported:**
+• All file types
+• Up to 4GB file size
+• Instant streaming
+• Mobile-friendly player
+
+**Commands:**
+/start - Start the bot
+/help - Show this help
+/stats - Show bot statistics`, { parse_mode: 'Markdown' });
+});
+
+// Handle file uploads
+bot.on('document', async (msg) => {
+  const chatId = msg.chat.id;
+  const document = msg.document;
+  
+  if (document.file_size > 4 * 1024 * 1024 * 1024) {
+    return bot.sendMessage(chatId, '❌ File too large! Maximum size is 4GB.');
+  }
+
+  const processingMsg = await bot.sendMessage(chatId, '⏳ Processing your file...');
+
+  try {
+    const fileInfo = await bot.getFile(document.file_id);
+    const fileUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${fileInfo.file_path}`;
+    
+    const uniqueId = crypto.randomBytes(16).toString('hex');
+    
+    // Store file metadata
+    fileDatabase.set(uniqueId, {
+      fileName: document.file_name,
+      fileSize: document.file_size,
+      mimeType: document.mime_type || 'application/octet-stream',
+      telegramUrl: fileUrl,
+      uploadTime: new Date(),
+      downloads: 0
+    });
+
+    const streamUrl = `${WEBHOOK_URL}/stream/${uniqueId}`;
+    
+    await bot.editMessageText(`✅ **File Ready!**
+
+📁 **${document.file_name}**
+📏 Size: ${formatFileSize(document.file_size)}
+
+🔗 **Stream Link:**
+${streamUrl}
+
+🌐 Click the link to access your file with streaming and download options!`, {
+      chat_id: chatId,
+      message_id: processingMsg.message_id,
+      parse_mode: 'Markdown',
+      reply_markup: {
+        inline_keyboard: [[
+          { text: '🌐 Open Stream', url: streamUrl },
+          { text: '📋 Copy Link', callback_data: `copy_${uniqueId}` }
+        ]]
+      }
+    });
+
+  } catch (error) {
+    console.error('Error processing file:', error);
+    bot.editMessageText('❌ Error processing file. Please try again.', {
+      chat_id: chatId,
+      message_id: processingMsg.message_id
+    });
+  }
+});
+
+// Handle other file types
+bot.on('video', handleFile);
+bot.on('audio', handleFile);
+bot.on('photo', handleFile);
+bot.on('voice', handleFile);
+bot.on('video_note', handleFile);
+
+async function handleFile(msg) {
+  const chatId = msg.chat.id;
+  const file = msg.video || msg.audio || msg.voice || msg.video_note || (msg.photo && msg.photo[msg.photo.length - 1]);
+  
+  if (!file) return;
+  
+  if (file.file_size > 4 * 1024 * 1024 * 1024) {
+    return bot.sendMessage(chatId, '❌ File too large! Maximum size is 4GB.');
+  }
+
+  const processingMsg = await bot.sendMessage(chatId, '⏳ Processing your file...');
+
+  try {
+    const fileInfo = await bot.getFile(file.file_id);
+    const fileUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${fileInfo.file_path}`;
+    
+    const uniqueId = crypto.randomBytes(16).toString('hex');
+    const fileName = file.file_name || `file_${Date.now()}`;
+    
+    fileDatabase.set(uniqueId, {
+      fileName,
+      fileSize: file.file_size,
+      mimeType: file.mime_type || 'application/octet-stream',
+      telegramUrl: fileUrl,
+      uploadTime: new Date(),
+      downloads: 0
+    });
+
+    const streamUrl = `${WEBHOOK_URL}/stream/${uniqueId}`;
+    
+    await bot.editMessageText(`✅ **File Ready!**
+
+📁 **${fileName}**
+📏 Size: ${formatFileSize(file.file_size)}
+
+🔗 **Stream Link:**
+${streamUrl}
+
+🌐 Click the link to access your file!`, {
+      chat_id: chatId,
+      message_id: processingMsg.message_id,
+      parse_mode: 'Markdown',
+      reply_markup: {
+        inline_keyboard: [[
+          { text: '🌐 Open Stream', url: streamUrl },
+          { text: '📋 Copy Link', callback_data: `copy_${uniqueId}` }
+        ]]
+      }
+    });
+
+  } catch (error) {
+    console.error('Error processing file:', error);
+    bot.editMessageText('❌ Error processing file. Please try again.', {
+      chat_id: chatId,
+      message_id: processingMsg.message_id
+    });
+  }
 }
 
-// Generate modern web page HTML
-function generateWebPage(fileId, fileInfo) {
-  return `
+// Callback query handler
+bot.on('callback_query', (query) => {
+  const data = query.data;
+  
+  if (data === 'help') {
+    bot.answerCallbackQuery(query.id, { text: 'Help information sent!' });
+    bot.sendMessage(query.message.chat.id, `📖 **How to Use:**
+
+1️⃣ Send any file to the bot
+2️⃣ Get instant streaming link
+3️⃣ Share the link with anyone
+4️⃣ Files can be streamed or downloaded
+
+**Features:**
+• All file types supported
+• Up to 4GB file size
+• Instant streaming
+• Modern web player
+• Mobile-friendly`, { parse_mode: 'Markdown' });
+  } else if (data === 'stats') {
+    const totalFiles = fileDatabase.size;
+    bot.answerCallbackQuery(query.id, { text: 'Stats loaded!' });
+    bot.sendMessage(query.message.chat.id, `📊 **Bot Statistics:**
+
+📁 Total Files: ${totalFiles}
+🚀 Status: Online
+💾 Storage: Active`);
+  } else if (data.startsWith('copy_')) {
+    const fileId = data.replace('copy_', '');
+    const streamUrl = `${WEBHOOK_URL}/stream/${fileId}`;
+    bot.answerCallbackQuery(query.id, { 
+      text: 'Link copied to clipboard!',
+      show_alert: true 
+    });
+  }
+});
+
+// Webhook endpoint
+app.post(`/bot${BOT_TOKEN}`, (req, res) => {
+  bot.processUpdate(req.body);
+  res.sendStatus(200);
+});
+
+// Stream endpoint
+app.get('/stream/:fileId', async (req, res) => {
+  const fileId = req.params.fileId;
+  const fileData = fileDatabase.get(fileId);
+  
+  if (!fileData) {
+    return res.status(404).send('File not found');
+  }
+
+  // Increment download counter
+  fileData.downloads++;
+  
+  res.send(`
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>${fileInfo.fileName} - File Stream</title>
+    <title>${fileData.fileName} - Stream</title>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
     <style>
         * {
             margin: 0;
@@ -268,19 +288,20 @@ function generateWebPage(fileId, fileInfo) {
         
         .container {
             background: rgba(255, 255, 255, 0.95);
-            backdrop-filter: blur(10px);
+            backdrop-filter: blur(20px);
             border-radius: 20px;
             padding: 40px;
+            box-shadow: 0 20px 40px rgba(0, 0, 0, 0.1);
             max-width: 600px;
             width: 100%;
-            box-shadow: 0 20px 40px rgba(0, 0, 0, 0.1);
             text-align: center;
+            border: 1px solid rgba(255, 255, 255, 0.2);
         }
         
         .file-icon {
             font-size: 4rem;
-            margin-bottom: 20px;
             color: #667eea;
+            margin-bottom: 20px;
         }
         
         .file-name {
@@ -297,18 +318,17 @@ function generateWebPage(fileId, fileInfo) {
             font-size: 1rem;
         }
         
-        .buttons {
+        .actions {
             display: flex;
             gap: 15px;
             justify-content: center;
             flex-wrap: wrap;
-            margin-bottom: 30px;
         }
         
         .btn {
             padding: 12px 24px;
             border: none;
-            border-radius: 10px;
+            border-radius: 50px;
             font-size: 1rem;
             font-weight: 600;
             cursor: pointer;
@@ -322,77 +342,27 @@ function generateWebPage(fileId, fileInfo) {
         }
         
         .btn-primary {
-            background: linear-gradient(45deg, #667eea, #764ba2);
+            background: linear-gradient(135deg, #667eea, #764ba2);
             color: white;
         }
         
         .btn-secondary {
-            background: #f8f9fa;
+            background: rgba(255, 255, 255, 0.2);
             color: #333;
-            border: 2px solid #e9ecef;
+            border: 2px solid rgba(102, 126, 234, 0.3);
         }
         
         .btn:hover {
             transform: translateY(-2px);
-            box-shadow: 0 10px 20px rgba(0, 0, 0, 0.1);
+            box-shadow: 0 10px 20px rgba(0, 0, 0, 0.2);
         }
         
-        .progress-container {
-            display: none;
-            margin-top: 20px;
-        }
-        
-        .progress-bar {
-            width: 100%;
-            height: 8px;
-            background: #e9ecef;
-            border-radius: 4px;
-            overflow: hidden;
-        }
-        
-        .progress-fill {
-            height: 100%;
-            background: linear-gradient(45deg, #667eea, #764ba2);
-            transition: width 0.3s ease;
-            width: 0%;
-        }
-        
-        .share-section {
+        .stats {
             margin-top: 30px;
-            padding-top: 30px;
-            border-top: 1px solid #e9ecef;
-        }
-        
-        .share-title {
-            font-size: 1.1rem;
-            font-weight: 600;
-            color: #333;
-            margin-bottom: 15px;
-        }
-        
-        .share-buttons {
-            display: flex;
-            gap: 10px;
-            justify-content: center;
-            flex-wrap: wrap;
-        }
-        
-        .share-btn {
-            padding: 8px 16px;
-            border: none;
-            border-radius: 8px;
+            padding-top: 20px;
+            border-top: 1px solid rgba(0, 0, 0, 0.1);
+            color: #666;
             font-size: 0.9rem;
-            cursor: pointer;
-            transition: all 0.3s ease;
-        }
-        
-        .copy-btn {
-            background: #28a745;
-            color: white;
-        }
-        
-        .copy-btn:hover {
-            background: #218838;
         }
         
         @media (max-width: 480px) {
@@ -400,7 +370,7 @@ function generateWebPage(fileId, fileInfo) {
                 padding: 30px 20px;
             }
             
-            .buttons {
+            .actions {
                 flex-direction: column;
             }
             
@@ -409,104 +379,172 @@ function generateWebPage(fileId, fileInfo) {
             }
         }
         
-        .toast {
-            position: fixed;
-            top: 20px;
-            right: 20px;
-            background: #28a745;
-            color: white;
-            padding: 12px 20px;
-            border-radius: 8px;
+        .loading {
             display: none;
-            z-index: 1000;
+            color: #667eea;
+            font-weight: 600;
+            margin-top: 15px;
+        }
+        
+        .media-player {
+            margin: 20px 0;
+            border-radius: 10px;
+            overflow: hidden;
+            box-shadow: 0 5px 15px rgba(0, 0, 0, 0.1);
         }
     </style>
 </head>
 <body>
     <div class="container">
-        <div class="file-icon">📁</div>
-        <h1 class="file-name">${fileInfo.fileName}</h1>
+        <div class="file-icon">
+            <i class="${getFileIcon(fileData.mimeType)}"></i>
+        </div>
+        
+        <h1 class="file-name">${fileData.fileName}</h1>
+        
         <div class="file-info">
-            Size: ${formatFileSize(fileInfo.fileSize)} • 
-            Uploaded: ${new Date(fileInfo.uploadedAt).toLocaleDateString()}
+            <i class="fas fa-file-alt"></i> ${formatFileSize(fileData.fileSize)} • 
+            <i class="fas fa-clock"></i> ${fileData.uploadTime.toLocaleDateString()} •
+            <i class="fas fa-download"></i> ${fileData.downloads} downloads
         </div>
         
-        <div class="buttons">
-            <a href="/stream/${fileId}" class="btn btn-primary" target="_blank">
-                🎬 Stream File
+        ${generateMediaPlayer(fileData)}
+        
+        <div class="actions">
+            <a href="/download/${fileId}" class="btn btn-primary" onclick="showLoading()">
+                <i class="fas fa-download"></i>
+                Download File
             </a>
-            <a href="/download/${fileId}" class="btn btn-secondary">
-                📥 Download
-            </a>
+            
+            <button class="btn btn-secondary" onclick="copyLink()">
+                <i class="fas fa-link"></i>
+                Copy Link
+            </button>
         </div>
         
-        <div class="progress-container">
-            <div class="progress-bar">
-                <div class="progress-fill"></div>
-            </div>
+        <div class="loading" id="loading">
+            <i class="fas fa-spinner fa-spin"></i> Preparing download...
         </div>
         
-        <div class="share-section">
-            <div class="share-title">Share Links</div>
-            <div class="share-buttons">
-                <button class="share-btn copy-btn" onclick="copyToClipboard('/stream/${fileId}', 'Stream')">
-                    📋 Copy Stream Link
-                </button>
-                <button class="share-btn copy-btn" onclick="copyToClipboard(window.location.href, 'Page')">
-                    📋 Copy Page Link
-                </button>
-            </div>
+        <div class="stats">
+            <i class="fas fa-shield-alt"></i> Secure streaming powered by Telegram Bot
         </div>
     </div>
     
-    <div class="toast" id="toast"></div>
-    
     <script>
-        function copyToClipboard(text, type) {
-            const fullUrl = window.location.origin + text;
-            navigator.clipboard.writeText(fullUrl).then(() => {
-                showToast(type + ' link copied to clipboard!');
-            }).catch(err => {
-                console.error('Failed to copy: ', err);
-                showToast('Failed to copy link');
+        function showLoading() {
+            document.getElementById('loading').style.display = 'block';
+        }
+        
+        function copyLink() {
+            navigator.clipboard.writeText(window.location.href).then(() => {
+                const btn = event.target.closest('.btn');
+                const originalText = btn.innerHTML;
+                btn.innerHTML = '<i class="fas fa-check"></i> Copied!';
+                btn.style.background = '#28a745';
+                
+                setTimeout(() => {
+                    btn.innerHTML = originalText;
+                    btn.style.background = '';
+                }, 2000);
             });
-        }
-        
-        function showToast(message) {
-            const toast = document.getElementById('toast');
-            toast.textContent = message;
-            toast.style.display = 'block';
-            setTimeout(() => {
-                toast.style.display = 'none';
-            }, 3000);
-        }
-        
-        // Add file type specific icon
-        const fileName = '${fileInfo.fileName}'.toLowerCase();
-        const fileIcon = document.querySelector('.file-icon');
-        
-        if (fileName.includes('.mp4') || fileName.includes('.avi') || fileName.includes('.mov')) {
-            fileIcon.textContent = '🎬';
-        } else if (fileName.includes('.mp3') || fileName.includes('.wav') || fileName.includes('.flac')) {
-            fileIcon.textContent = '🎵';
-        } else if (fileName.includes('.jpg') || fileName.includes('.png') || fileName.includes('.gif')) {
-            fileIcon.textContent = '🖼️';
-        } else if (fileName.includes('.pdf')) {
-            fileIcon.textContent = '📄';
-        } else if (fileName.includes('.zip') || fileName.includes('.rar')) {
-            fileIcon.textContent = '📦';
-        } else {
-            fileIcon.textContent = '📁';
         }
     </script>
 </body>
-</html>`;
+</html>
+  `);
+});
+
+// Download endpoint
+app.get('/download/:fileId', async (req, res) => {
+  const fileId = req.params.fileId;
+  const fileData = fileDatabase.get(fileId);
+  
+  if (!fileData) {
+    return res.status(404).send('File not found');
+  }
+  
+  try {
+    const response = await fetch(fileData.telegramUrl);
+    
+    if (!response.ok) {
+      throw new Error('Failed to fetch file');
+    }
+    
+    res.setHeader('Content-Disposition', `attachment; filename="${fileData.fileName}"`);
+    res.setHeader('Content-Type', fileData.mimeType);
+    res.setHeader('Content-Length', fileData.fileSize);
+    
+    response.body.pipe(res);
+    
+  } catch (error) {
+    console.error('Download error:', error);
+    res.status(500).send('Error downloading file');
+  }
+});
+
+// Utility functions
+function formatFileSize(bytes) {
+  if (bytes === 0) return '0 Bytes';
+  const k = 1024;
+  const sizes = ['Bytes', 'KB', 'MB', 'GB'];
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
 }
+
+function getFileIcon(mimeType) {
+  if (!mimeType) return 'fas fa-file';
+  
+  if (mimeType.startsWith('video/')) return 'fas fa-video';
+  if (mimeType.startsWith('audio/')) return 'fas fa-music';
+  if (mimeType.startsWith('image/')) return 'fas fa-image';
+  if (mimeType.includes('pdf')) return 'fas fa-file-pdf';
+  if (mimeType.includes('zip') || mimeType.includes('rar')) return 'fas fa-file-archive';
+  if (mimeType.includes('doc')) return 'fas fa-file-word';
+  if (mimeType.includes('sheet')) return 'fas fa-file-excel';
+  
+  return 'fas fa-file';
+}
+
+function generateMediaPlayer(fileData) {
+  const mimeType = fileData.mimeType;
+  
+  if (mimeType && mimeType.startsWith('video/')) {
+    return `
+      <div class="media-player">
+        <video controls width="100%" preload="metadata">
+          <source src="/download/${Array.from(fileDatabase.entries()).find(([k, v]) => v === fileData)[0]}" type="${mimeType}">
+          Your browser does not support video playback.
+        </video>
+      </div>
+    `;
+  }
+  
+  if (mimeType && mimeType.startsWith('audio/')) {
+    return `
+      <div class="media-player">
+        <audio controls width="100%" preload="metadata">
+          <source src="/download/${Array.from(fileDatabase.entries()).find(([k, v]) => v === fileData)[0]}" type="${mimeType}">
+          Your browser does not support audio playback.
+        </audio>
+      </div>
+    `;
+  }
+  
+  return '';
+}
+
+// Health check
+app.get('/', (req, res) => {
+  res.send(`
+    <h1>🚀 Telegram File Stream Bot</h1>
+    <p>Bot is running successfully!</p>
+    <p>Add your bot to Telegram and start sharing files.</p>
+  `);
+});
 
 // Start server
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
-  console.log(`🤖 Bot is active and listening for files...`);
+  console.log(`📱 Bot is ready to receive files!`);
 });
-
-module.exports = { app, bot };
